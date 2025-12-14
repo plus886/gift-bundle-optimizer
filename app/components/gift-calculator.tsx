@@ -30,7 +30,7 @@ type TieredCalculationResult = {
 
 const DEFAULT_THRESHOLD_A = "2000";
 const DEFAULT_THRESHOLD_B = "1000";
-const DEFAULT_ITEMS: PurchaseItem[] = [{ price: "", quantity: "1" }];
+const DEFAULT_ITEMS: PurchaseItem[] = [{ price: "", quantity: "" }];
 
 export function GiftCalculator() {
   const [thresholdA, setThresholdA] = useState(DEFAULT_THRESHOLD_A);
@@ -49,7 +49,7 @@ export function GiftCalculator() {
     };
 
   const addItem = () => {
-    setItems((prev) => [...prev, { price: "", quantity: "1" }]);
+    setItems((prev) => [...prev, { price: "", quantity: "" }]);
   };
 
   const updateItem = (
@@ -114,9 +114,7 @@ export function GiftCalculator() {
       }
 
       if (expandedItems.length > MAX_ITEMS) {
-        throw new Error(
-          `最多只能計算合計${MAX_ITEMS}件，請調整購買數量。`
-        );
+        throw new Error(`最多只能計算合計${MAX_ITEMS}件，請調整購買數量。`);
       }
 
       const tierA = optimizeGiftBundles(expandedItems, parsedThresholdA);
@@ -133,12 +131,19 @@ export function GiftCalculator() {
       });
     } catch (err) {
       setCalculation(null);
-      const message =
-        err instanceof Error ? err.message : "計算時發生錯誤。";
+      const message = err instanceof Error ? err.message : "計算時發生錯誤。";
       setError(message);
     } finally {
       setIsCalculating(false);
     }
+  };
+
+  const handleReset = () => {
+    setThresholdA(DEFAULT_THRESHOLD_A);
+    setThresholdB(DEFAULT_THRESHOLD_B);
+    setItems(DEFAULT_ITEMS);
+    setCalculation(null);
+    setError(null);
   };
 
   return (
@@ -153,6 +158,7 @@ export function GiftCalculator() {
         onUpdateItem={updateItem}
         onRemoveItem={removeItem}
         onCalculate={handleCalculate}
+        onReset={handleReset}
         isCalculating={isCalculating}
       />
       <ResultsPanel
@@ -172,9 +178,14 @@ type GiftParametersProps = {
   onChangeThresholdA: (value: string) => void;
   onChangeThresholdB: (value: string) => void;
   onAddItem: () => void;
-  onUpdateItem: (index: number, field: keyof PurchaseItem, value: string) => void;
+  onUpdateItem: (
+    index: number,
+    field: keyof PurchaseItem,
+    value: string
+  ) => void;
   onRemoveItem: (index: number) => void;
   onCalculate: () => void;
+  onReset: () => void;
   isCalculating: boolean;
 };
 
@@ -188,8 +199,18 @@ function GiftParameters({
   onUpdateItem,
   onRemoveItem,
   onCalculate,
+  onReset,
   isCalculating,
 }: GiftParametersProps) {
+  const hasInvalidQuantity = items.some((item) => {
+    const quantityValue = Number(item.quantity);
+    return (
+      !Number.isFinite(quantityValue) ||
+      quantityValue < 1 ||
+      item.quantity.trim() === ""
+    );
+  });
+
   return (
     <FieldSet>
       <FieldLegend>參數</FieldLegend>
@@ -204,9 +225,12 @@ function GiftParameters({
               <Input
                 inputMode="numeric"
                 value={thresholdA}
-                onChange={(event) => onChangeThresholdA(event.currentTarget.value)}
-                placeholder="例：2000"
+                onChange={(event) =>
+                  onChangeThresholdA(event.currentTarget.value)
+                }
+                placeholder="例如：2000"
                 aria-label="贈品A的門檻金額"
+                disabled
               />
             </div>
             <div className="space-y-2 rounded-xl border border-white/10 bg-white/5 p-4">
@@ -216,9 +240,12 @@ function GiftParameters({
               <Input
                 inputMode="numeric"
                 value={thresholdB}
-                onChange={(event) => onChangeThresholdB(event.currentTarget.value)}
-                placeholder="例：1000"
+                onChange={(event) =>
+                  onChangeThresholdB(event.currentTarget.value)
+                }
+                placeholder="例如：1000"
                 aria-label="贈品B的門檻金額"
+                disabled
               />
             </div>
           </div>
@@ -227,6 +254,16 @@ function GiftParameters({
           </FieldDescription>
         </FieldContent>
       </Field>
+
+      <Button
+        type="button"
+        variant="secondary"
+        onClick={onReset}
+        disabled={isCalculating}
+        className="w-full border border-white/20 bg-transparent text-white hover:bg-white/10"
+      >
+        重設
+      </Button>
 
       <Field>
         <FieldLabel>購買金額 × 數量</FieldLabel>
@@ -255,7 +292,7 @@ function GiftParameters({
         <Button
           type="button"
           onClick={onCalculate}
-          disabled={isCalculating}
+          disabled={isCalculating || hasInvalidQuantity}
           className="w-full bg-emerald-500 text-white hover:bg-emerald-600 focus-visible:bg-emerald-600"
         >
           {isCalculating ? "計算中..." : "開始計算"}
@@ -289,7 +326,7 @@ function PurchaseItemList({
               value={item.price}
               aria-label={`購買金額 ${index + 1}`}
               inputMode="numeric"
-              placeholder="金額（例：1400）"
+              placeholder="金額（例如：1400）"
               onChange={(event) =>
                 onUpdateItem(index, "price", event.currentTarget.value)
               }
@@ -341,15 +378,30 @@ function ResultsPanel({
         <p className="mt-4 text-sm text-red-300">{error}</p>
       ) : summary ? (
         <div className="mt-4 space-y-6">
-          <SummaryTotals summary={summary} thresholdA={thresholdA} thresholdB={thresholdB} />
-          <ResultStats summary={summary} thresholdA={thresholdA} thresholdB={thresholdB} />
-          <GiftCombinationList summary={summary} thresholdA={thresholdA} thresholdB={thresholdB} />
+          <SummaryTotals
+            summary={summary}
+            thresholdA={thresholdA}
+            thresholdB={thresholdB}
+          />
+          <ResultStats
+            summary={summary}
+            thresholdA={thresholdA}
+            thresholdB={thresholdB}
+          />
+          <GiftCombinationList
+            summary={summary}
+            thresholdA={thresholdA}
+            thresholdB={thresholdB}
+          />
           {summary.tierB.leftover.length ? (
             <div>
               <p className="text-sm font-semibold text-white/80">未使用</p>
               <p className="text-xs text-white/70">
                 {summary.tierB.leftover
-                  .map((item) => `#${item.position}: $${item.amount.toLocaleString()}`)
+                  .map(
+                    (item) =>
+                      `#${item.position}: $${item.amount.toLocaleString()}`
+                  )
                   .join(", ")}
               </p>
             </div>
@@ -513,7 +565,9 @@ function GiftCombinationList({
               ))}
             </ul>
           ) : (
-            <p className="text-sm text-white/70">沒有符合 {label} 門檻的組合。</p>
+            <p className="text-sm text-white/70">
+              沒有符合 {label} 門檻的組合。
+            </p>
           )}
         </div>
       ))}
