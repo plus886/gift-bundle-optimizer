@@ -12,62 +12,29 @@ import {
 } from "~/components/ui/field";
 import type { BundleOptimizationResult } from "~/lib/gift-optimizer";
 import { MAX_ITEMS, optimizeGiftBundles } from "~/lib/gift-optimizer";
-import {
-  applyTieredDiscounts,
-  type AppliedDiscount,
-  type DiscountTier,
-} from "~/lib/discounts";
 
 type PurchaseItem = {
   price: string;
   quantity: string;
-  discountable: boolean;
 };
 
 type TieredCalculationResult = {
   tierA: BundleOptimizationResult;
   tierB: BundleOptimizationResult;
   combined: {
-    totalAmountBeforeDiscount: number;
-    totalAmountAfterDiscount: number;
+    totalAmount: number;
     coveredAmount: number;
     totalGifts: number;
-  };
-  discount: {
-    savings: number;
-    appliedTier: AppliedDiscount | null;
   };
 };
 
 const DEFAULT_THRESHOLD_A = "2000";
 const DEFAULT_THRESHOLD_B = "1000";
-const DEFAULT_ITEMS: PurchaseItem[] = [
-  { price: "", quantity: "", discountable: false },
-];
-const DEFAULT_DISCOUNT_THRESHOLD_LOWER = "3000";
-const DEFAULT_DISCOUNT_RATE_LOWER = "10";
-const DEFAULT_DISCOUNT_CAP_LOWER = "10000";
-const DEFAULT_DISCOUNT_THRESHOLD_HIGH = "10000";
-const DEFAULT_DISCOUNT_RATE_HIGH = "20";
+const DEFAULT_ITEMS: PurchaseItem[] = [{ price: "", quantity: "" }];
 
 export function GiftCalculator() {
   const [thresholdA, setThresholdA] = useState(DEFAULT_THRESHOLD_A);
   const [thresholdB, setThresholdB] = useState(DEFAULT_THRESHOLD_B);
-  const [discountThresholdLower, setDiscountThresholdLower] = useState(
-    DEFAULT_DISCOUNT_THRESHOLD_LOWER
-  );
-  const [discountThresholdHigh, setDiscountThresholdHigh] = useState(
-    DEFAULT_DISCOUNT_THRESHOLD_HIGH
-  );
-  const [discountRateLower, setDiscountRateLower] = useState(
-    DEFAULT_DISCOUNT_RATE_LOWER
-  );
-  const [discountRateHigh, setDiscountRateHigh] = useState(
-    DEFAULT_DISCOUNT_RATE_HIGH
-  );
-  const [discountCapLower, setDiscountCapLower] = useState(
-    DEFAULT_DISCOUNT_CAP_LOWER
-  );
   const [items, setItems] = useState<PurchaseItem[]>(DEFAULT_ITEMS);
   const [calculation, setCalculation] =
     useState<TieredCalculationResult | null>(null);
@@ -76,36 +43,27 @@ export function GiftCalculator() {
 
   const summary = calculation;
 
-  const handleNumberChange =
+  const handleThresholdChange =
     (setter: (value: string) => void) => (value: string) => {
       setter(value.replace(/[^0-9.]/g, ""));
     };
 
   const addItem = () => {
-    setItems((prev) => [
-      ...prev,
-      { price: "", quantity: "", discountable: false },
-    ]);
+    setItems((prev) => [...prev, { price: "", quantity: "" }]);
   };
 
   const updateItem = (
     index: number,
     field: keyof PurchaseItem,
-    rawValue: string | boolean
+    rawValue: string
   ) => {
+    const sanitized = rawValue.replace(/[^0-9.]/g, "");
     setItems((prev) => {
       const next = [...prev];
-      const value =
-        field === "discountable" && typeof rawValue === "boolean"
-          ? rawValue
-          : typeof rawValue === "string"
-            ? rawValue.replace(/[^0-9.]/g, "")
-            : rawValue;
-
       next[index] = {
         ...next[index],
-        [field]: value,
-      } as PurchaseItem;
+        [field]: sanitized,
+      };
       return next;
     });
   };
@@ -121,12 +79,6 @@ export function GiftCalculator() {
     try {
       const parsedThresholdA = Number(thresholdA);
       const parsedThresholdB = Number(thresholdB);
-      const parsedDiscountThresholdLower = Number(discountThresholdLower);
-      const parsedDiscountThresholdHigh = Number(discountThresholdHigh);
-      const parsedDiscountRateLower = Number(discountRateLower) / 100;
-      const parsedDiscountRateHigh = Number(discountRateHigh) / 100;
-      const parsedDiscountCapLower =
-        discountCapLower.trim() === "" ? null : Number(discountCapLower);
 
       if (!Number.isFinite(parsedThresholdA) || parsedThresholdA <= 0) {
         throw new Error("請正確輸入贈品A的門檻金額。");
@@ -136,54 +88,26 @@ export function GiftCalculator() {
         throw new Error("請正確輸入贈品B的門檻金額。");
       }
 
-      if (
-        !Number.isFinite(parsedDiscountThresholdLower) ||
-        parsedDiscountThresholdLower <= 0 ||
-        !Number.isFinite(parsedDiscountThresholdHigh) ||
-        parsedDiscountThresholdHigh <= 0
-      ) {
-        throw new Error("請輸入有效的折扣門檻金額。");
-      }
-
-      if (
-        !Number.isFinite(parsedDiscountRateLower) ||
-        parsedDiscountRateLower <= 0 ||
-        !Number.isFinite(parsedDiscountRateHigh) ||
-        parsedDiscountRateHigh <= 0
-      ) {
-        throw new Error("請輸入有效的折扣率 (例: 10)。");
-      }
-
-      if (
-        parsedDiscountCapLower !== null &&
-        (!Number.isFinite(parsedDiscountCapLower) || parsedDiscountCapLower < 0)
-      ) {
-        throw new Error("折扣上限請輸入大於等於0的數值。");
-      }
-
       let positionCounter = 1;
-      const expandedItems = items.flatMap(
-        ({ price, quantity, discountable }) => {
-          const amountValue = Number(price || "0");
-          const quantityValue = Number(quantity || "0");
-          const sanitizedQuantity = Math.floor(quantityValue);
+      const expandedItems = items.flatMap(({ price, quantity }) => {
+        const amountValue = Number(price || "0");
+        const quantityValue = Number(quantity || "0");
+        const sanitizedQuantity = Math.floor(quantityValue);
 
-          if (
-            !Number.isFinite(amountValue) ||
-            amountValue <= 0 ||
-            !Number.isFinite(sanitizedQuantity) ||
-            sanitizedQuantity <= 0
-          ) {
-            return [];
-          }
-
-          return Array.from({ length: sanitizedQuantity }, () => ({
-            amount: amountValue,
-            position: positionCounter++,
-            discountable,
-          }));
+        if (
+          !Number.isFinite(amountValue) ||
+          amountValue <= 0 ||
+          !Number.isFinite(sanitizedQuantity) ||
+          sanitizedQuantity <= 0
+        ) {
+          return [];
         }
-      );
+
+        return Array.from({ length: sanitizedQuantity }, () => ({
+          amount: amountValue,
+          position: positionCounter++,
+        }));
+      });
 
       if (!expandedItems.length) {
         throw new Error("請輸入每筆金額與數量。");
@@ -193,38 +117,16 @@ export function GiftCalculator() {
         throw new Error(`最多只能計算合計${MAX_ITEMS}件，請調整購買數量。`);
       }
 
-      const discountTiers: DiscountTier[] = [
-        {
-          threshold: parsedDiscountThresholdLower,
-          rate: parsedDiscountRateLower,
-          cap: parsedDiscountCapLower ?? undefined,
-        },
-        {
-          threshold: parsedDiscountThresholdHigh,
-          rate: parsedDiscountRateHigh,
-        },
-      ];
-
-      const discounted = applyTieredDiscounts(expandedItems, discountTiers);
-
-      const tierA = optimizeGiftBundles(
-        discounted.discountedItems,
-        parsedThresholdA
-      );
+      const tierA = optimizeGiftBundles(expandedItems, parsedThresholdA);
       const tierB = optimizeGiftBundles(tierA.leftover, parsedThresholdB);
 
       setCalculation({
         tierA,
         tierB,
         combined: {
-          totalAmountBeforeDiscount: discounted.totalBefore,
-          totalAmountAfterDiscount: discounted.totalAfter,
+          totalAmount: tierA.totalAmount,
           coveredAmount: tierA.coveredAmount + tierB.coveredAmount,
           totalGifts: tierA.totalGifts + tierB.totalGifts,
-        },
-        discount: {
-          savings: discounted.savings,
-          appliedTier: discounted.appliedTier,
         },
       });
     } catch (err) {
@@ -239,11 +141,6 @@ export function GiftCalculator() {
   const handleReset = () => {
     setThresholdA(DEFAULT_THRESHOLD_A);
     setThresholdB(DEFAULT_THRESHOLD_B);
-    setDiscountThresholdLower(DEFAULT_DISCOUNT_THRESHOLD_LOWER);
-    setDiscountThresholdHigh(DEFAULT_DISCOUNT_THRESHOLD_HIGH);
-    setDiscountRateLower(DEFAULT_DISCOUNT_RATE_LOWER);
-    setDiscountRateHigh(DEFAULT_DISCOUNT_RATE_HIGH);
-    setDiscountCapLower(DEFAULT_DISCOUNT_CAP_LOWER);
     setItems(DEFAULT_ITEMS);
     setCalculation(null);
     setError(null);
@@ -254,23 +151,9 @@ export function GiftCalculator() {
       <GiftParameters
         thresholdA={thresholdA}
         thresholdB={thresholdB}
-        discountThresholdLower={discountThresholdLower}
-        discountThresholdHigh={discountThresholdHigh}
-        discountRateLower={discountRateLower}
-        discountRateHigh={discountRateHigh}
-        discountCapLower={discountCapLower}
         items={items}
-        onChangeThresholdA={handleNumberChange(setThresholdA)}
-        onChangeThresholdB={handleNumberChange(setThresholdB)}
-        onChangeDiscountThresholdLower={handleNumberChange(
-          setDiscountThresholdLower
-        )}
-        onChangeDiscountThresholdHigh={handleNumberChange(
-          setDiscountThresholdHigh
-        )}
-        onChangeDiscountRateLower={handleNumberChange(setDiscountRateLower)}
-        onChangeDiscountRateHigh={handleNumberChange(setDiscountRateHigh)}
-        onChangeDiscountCapLower={handleNumberChange(setDiscountCapLower)}
+        onChangeThresholdA={handleThresholdChange(setThresholdA)}
+        onChangeThresholdB={handleThresholdChange(setThresholdB)}
         onAddItem={addItem}
         onUpdateItem={updateItem}
         onRemoveItem={removeItem}
@@ -291,24 +174,14 @@ export function GiftCalculator() {
 type GiftParametersProps = {
   thresholdA: string;
   thresholdB: string;
-  discountThresholdLower: string;
-  discountThresholdHigh: string;
-  discountRateLower: string;
-  discountRateHigh: string;
-  discountCapLower: string;
   items: PurchaseItem[];
   onChangeThresholdA: (value: string) => void;
   onChangeThresholdB: (value: string) => void;
-  onChangeDiscountThresholdLower: (value: string) => void;
-  onChangeDiscountThresholdHigh: (value: string) => void;
-  onChangeDiscountRateLower: (value: string) => void;
-  onChangeDiscountRateHigh: (value: string) => void;
-  onChangeDiscountCapLower: (value: string) => void;
   onAddItem: () => void;
   onUpdateItem: (
     index: number,
     field: keyof PurchaseItem,
-    value: string | boolean
+    value: string
   ) => void;
   onRemoveItem: (index: number) => void;
   onCalculate: () => void;
@@ -319,19 +192,9 @@ type GiftParametersProps = {
 function GiftParameters({
   thresholdA,
   thresholdB,
-  discountThresholdLower,
-  discountThresholdHigh,
-  discountRateLower,
-  discountRateHigh,
-  discountCapLower,
   items,
   onChangeThresholdA,
   onChangeThresholdB,
-  onChangeDiscountThresholdLower,
-  onChangeDiscountThresholdHigh,
-  onChangeDiscountRateLower,
-  onChangeDiscountRateHigh,
-  onChangeDiscountCapLower,
   onAddItem,
   onUpdateItem,
   onRemoveItem,
@@ -388,84 +251,6 @@ function GiftParameters({
           </div>
           <FieldDescription>
             會先盡量湊足高門檻的贈品A，再用剩餘金額爭取贈品B。
-          </FieldDescription>
-        </FieldContent>
-      </Field>
-
-      <Field>
-        <FieldLabel>折扣設定</FieldLabel>
-        <FieldContent className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="space-y-2 rounded-xl border border-white/10 bg-white/5 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-white/70">
-                10% 折扣
-              </p>
-              <div className="grid gap-2 md:grid-cols-2">
-                <Input
-                  inputMode="numeric"
-                  value={discountThresholdLower}
-                  onChange={(event) =>
-                    onChangeDiscountThresholdLower(event.currentTarget.value)
-                  }
-                  placeholder="門檻 (例：3000)"
-                  aria-label="10%折扣的門檻金額"
-                  disabled
-                />
-                <Input
-                  inputMode="numeric"
-                  value={discountRateLower}
-                  onChange={(event) =>
-                    onChangeDiscountRateLower(event.currentTarget.value)
-                  }
-                  placeholder="折扣率 (例：10)"
-                  aria-label="10%折扣的折扣率"
-                  disabled
-                />
-              </div>
-              <Input
-                inputMode="numeric"
-                value={discountCapLower}
-                onChange={(event) =>
-                  onChangeDiscountCapLower(event.currentTarget.value)
-                }
-                placeholder="可折扣上限金額 (例：10000)"
-                aria-label="10%折扣的可折扣上限金額"
-                disabled
-              />
-            </div>
-            <div className="space-y-2 rounded-xl border border-white/10 bg-white/5 p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-white/70">
-                20% 折扣
-              </p>
-              <div className="grid gap-2 md:grid-cols-2">
-                <Input
-                  inputMode="numeric"
-                  value={discountThresholdHigh}
-                  onChange={(event) =>
-                    onChangeDiscountThresholdHigh(event.currentTarget.value)
-                  }
-                  placeholder="門檻 (例：10000)"
-                  aria-label="20%折扣的門檻金額"
-                  disabled
-                />
-                <Input
-                  inputMode="numeric"
-                  value={discountRateHigh}
-                  onChange={(event) =>
-                    onChangeDiscountRateHigh(event.currentTarget.value)
-                  }
-                  placeholder="折扣率 (例：20)"
-                  aria-label="20%折扣的折扣率"
-                  disabled
-                />
-              </div>
-              <FieldDescription>
-                會優先找到達門檻的最小組合，其餘金額套用折扣。
-              </FieldDescription>
-            </div>
-          </div>
-          <FieldDescription>
-            若商品不享折扣，請取消下方「可折扣」勾選。
           </FieldDescription>
         </FieldContent>
       </Field>
@@ -557,33 +342,16 @@ function PurchaseItemList({
               }
             />
           </div>
-          <div className="flex flex-1 flex-col gap-2 md:flex-row md:items-center md:justify-end md:gap-4">
-            <label className="flex items-center gap-2 text-xs text-white/80">
-              <input
-                type="checkbox"
-                checked={item.discountable}
-                onChange={(event) =>
-                  onUpdateItem(
-                    index,
-                    "discountable",
-                    event.currentTarget.checked
-                  )
-                }
-                className="h-4 w-4 rounded border-white/40 bg-transparent"
-              />
-              可折扣
-            </label>
-            {items.length > 1 ? (
-              <Button
-                type="button"
-                variant="ghost"
-                className="text-xs text-white/70 hover:text-white"
-                onClick={() => onRemoveItem(index)}
-              >
-                刪除
-              </Button>
-            ) : null}
-          </div>
+          {items.length > 1 ? (
+            <Button
+              type="button"
+              variant="ghost"
+              className="text-xs text-white/70 hover:text-white"
+              onClick={() => onRemoveItem(index)}
+            >
+              刪除
+            </Button>
+          ) : null}
         </div>
       ))}
     </div>
@@ -615,7 +383,6 @@ function ResultsPanel({
             thresholdA={thresholdA}
             thresholdB={thresholdB}
           />
-          <DiscountSummary discount={summary.discount} />
           <ResultStats
             summary={summary}
             thresholdA={thresholdA}
@@ -703,51 +470,6 @@ function SummaryTotals({
   );
 }
 
-function DiscountSummary({
-  discount,
-}: {
-  discount: TieredCalculationResult["discount"];
-}) {
-  const tier = discount.appliedTier;
-  const discountedLabel =
-    tier && tier.discountedPositions.length
-      ? tier.discountedPositions.map((pos) => `#${pos}`).join(", ")
-      : "無（僅門檻商品即可達成）";
-  const qualifyingLabel =
-    tier && tier.qualifyingPositions.length
-      ? tier.qualifyingPositions.map((pos) => `#${pos}`).join(", ")
-      : "未套用";
-
-  return (
-    <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-4 text-sm text-white/80">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="font-semibold text-white">折扣</p>
-        <p className="text-xs text-white/70">
-          {tier ? "已套用最優惠折扣組合" : "未套用"}
-        </p>
-      </div>
-      {tier ? (
-        <div className="mt-2 space-y-1 text-white/80">
-          <p>
-            門檻 ${tier.threshold.toLocaleString()} ／{" "}
-            {Math.round(tier.rate * 100)}%
-            {tier.cap !== null ? ` ／ 上限 ${tier.cap.toLocaleString()}` : ""}
-          </p>
-          <p>計入門檻的商品: {qualifyingLabel}</p>
-          <p>享受折扣的商品: {discountedLabel}</p>
-          <p className="font-semibold text-emerald-200">
-            折扣金額 ${discount.savings.toLocaleString()}
-          </p>
-        </div>
-      ) : (
-        <p className="mt-2 text-white/70">
-          未套用折扣（未達門檻或無可折扣商品）。
-        </p>
-      )}
-    </div>
-  );
-}
-
 function ResultStats({
   summary,
   thresholdA,
@@ -760,15 +482,9 @@ function ResultStats({
   return (
     <div className="grid gap-3 text-sm text-white/80">
       <p>
-        折扣前購買金額:{" "}
+        總購買金額:{" "}
         <span className="font-semibold text-white">
-          ${summary.combined.totalAmountBeforeDiscount.toLocaleString()}
-        </span>
-      </p>
-      <p>
-        折扣後購買金額:{" "}
-        <span className="font-semibold text-emerald-200">
-          ${summary.combined.totalAmountAfterDiscount.toLocaleString()}
+          ${summary.combined.totalAmount.toLocaleString()}
         </span>
       </p>
       <p>
