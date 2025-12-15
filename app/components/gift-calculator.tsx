@@ -48,7 +48,7 @@ const DEFAULT_DISCOUNT_THRESHOLD_LOWER = "3000";
 const DEFAULT_DISCOUNT_RATE_LOWER = "10";
 const DEFAULT_DISCOUNT_CAP_LOWER = "10000";
 const DEFAULT_DISCOUNT_THRESHOLD_HIGH = "10000";
-const DEFAULT_DISCOUNT_RATE_HIGH = "20";
+const DEFAULT_DISCOUNT_RATE_HIGH = "12";
 
 export function GiftCalculator() {
   const [thresholdA, setThresholdA] = useState(DEFAULT_THRESHOLD_A);
@@ -435,7 +435,7 @@ function GiftParameters({
             </div>
             <div className="space-y-2 rounded-xl border border-white/10 bg-white/5 p-4">
               <p className="text-xs font-semibold uppercase tracking-wide text-white/70">
-                20% 折扣
+                12% 折扣
               </p>
               <div className="grid gap-2 md:grid-cols-2">
                 <Input
