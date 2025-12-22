@@ -215,6 +215,13 @@ function performLocalImprovements(
       continue;
     }
 
+    // 完成グループと pool の swap で「大きいアイテム」を pool に戻す
+    const swapped = swapItemBetweenGroupAndPool(completed, pool, threshold);
+    if (swapped) {
+      poolDirty = true;
+      continue;
+    }
+
     // poolの「あと少し」を、完成グループからの直接寄付で一手完成
     if (enableDirectDonate) {
       ensurePoolSorted();
@@ -463,4 +470,67 @@ export function expandByQuantity(
     for (let i = 0; i < q; i++) out.push({ amount: amt, position: pos++ });
   }
   return out;
+}
+
+function swapItemBetweenGroupAndPool(
+  completed: WorkingGroup[],
+  pool: BundleItem[],
+  threshold: number
+): boolean {
+  if (!pool.length || !completed.length) return false;
+
+  // pool は小さいものから使いたい（=グループの超過を減らしたい）
+  const poolAsc = [...pool].sort((a, b) => a.amount - b.amount);
+
+  // 超過が大きい完成グループから試す
+  const donors = completed
+    .map((g, idx) => ({ g, idx, surplus: g.total - threshold }))
+    .filter((d) => d.surplus > 0)
+    .sort((a, b) => b.surplus - a.surplus);
+
+  for (const d of donors) {
+    // グループ内は大きい item から試す（大→小に入れ替えると超過が減る）
+    const groupItemsDesc = [...d.g.items].sort((a, b) => b.amount - a.amount);
+
+    for (const gItem of groupItemsDesc) {
+      // gItem を外しても、poolItem を入れれば threshold を満たす必要がある
+      // newTotal = g.total - gItem + poolItem >= threshold
+      // かつ poolItem < gItem（入れ替えの意味がある）
+      const need = threshold - (d.g.total - gItem.amount);
+
+      // need を満たす最小の poolItem を探す（超過を最小化）
+      const candidate = poolAsc.find(
+        (p) => p.amount >= need && p.amount < gItem.amount
+      );
+      if (!candidate) continue;
+
+      // --- swap 実行 ---
+      // pool から candidate を削除
+      const poolIdx = pool.findIndex((p) => p.position === candidate.position);
+      if (poolIdx < 0) continue;
+      pool.splice(poolIdx, 1);
+
+      // group から gItem を削除
+      const groupIdx = d.g.items.findIndex(
+        (it) => it.position === gItem.position
+      );
+      if (groupIdx < 0) {
+        // ロールバック
+        pool.push(candidate);
+        continue;
+      }
+      d.g.items.splice(groupIdx, 1);
+
+      // group に candidate を追加
+      d.g.items.push(candidate);
+      d.g.total = d.g.total - gItem.amount + candidate.amount;
+
+      // pool に gItem を戻す
+      pool.push(gItem);
+
+      return true;
+    }
+  }
+
+  return false;
 }
