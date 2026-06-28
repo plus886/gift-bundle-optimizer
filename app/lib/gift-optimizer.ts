@@ -4,7 +4,7 @@
 // - 同一商品（同額）を複数個扱うのは「別BundleItemとして渡す」ことで対応
 //   例: 500円を4つ -> [{amount:500,pos:1},{amount:500,pos:2},{amount:500,pos:3},{amount:500,pos:4}]
 
-export const MAX_ITEMS = 100;
+export const MAX_ITEMS = 1000;
 
 export type BundleItem = {
   amount: number;
