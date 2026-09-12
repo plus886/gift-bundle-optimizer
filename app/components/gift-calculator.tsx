@@ -41,23 +41,16 @@ const TIER_CONFIGS: TierConfig[] = [
   {
     code: "A",
     label: "贈品A",
-    defaultThreshold: "3500",
+    defaultThreshold: "2000",
     cardAccent: "from-amber-300/60 to-amber-500/50 text-amber-100",
     textAccent: "text-amber-200",
   },
   {
     code: "B",
     label: "贈品B",
-    defaultThreshold: "2000",
+    defaultThreshold: "1000",
     cardAccent: "from-sky-300/60 to-sky-500/50 text-sky-100",
     textAccent: "text-sky-200",
-  },
-  {
-    code: "C",
-    label: "贈品C",
-    defaultThreshold: "1000",
-    cardAccent: "from-violet-300/60 to-violet-500/50 text-violet-100",
-    textAccent: "text-violet-200",
   },
 ];
 
@@ -242,7 +235,7 @@ function GiftParameters({
       <Field>
         <FieldLabel>贈品門檻金額</FieldLabel>
         <FieldContent className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-3">
+          <div className="grid gap-3 md:grid-cols-2">
             {TIER_CONFIGS.map((tier, index) => (
               <div
                 key={tier.label}
@@ -265,7 +258,7 @@ function GiftParameters({
             ))}
           </div>
           <FieldDescription>
-            會先盡量湊足高門檻的贈品A，再依序用剩餘金額爭取贈品B、贈品C。
+            會先盡量湊足高門檻的贈品A，再用剩餘金額爭取贈品B。
           </FieldDescription>
         </FieldContent>
       </Field>
@@ -426,7 +419,7 @@ function SummaryTotals({ summary }: { summary: TieredCalculationResult }) {
         </p>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="grid gap-3 md:grid-cols-2">
         {TIER_CONFIGS.map((tier, index) => {
           const result = summary.tiers[index];
           if (!result) return null;
