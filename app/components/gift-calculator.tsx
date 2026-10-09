@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
@@ -10,22 +10,16 @@ import {
   FieldLegend,
   FieldSet,
 } from "~/components/ui/field";
-import type { BundleOptimizationResult } from "~/lib/gift-optimizer";
-import { MAX_ITEMS, optimizeGiftBundles } from "~/lib/gift-optimizer";
+import type {
+  BundleItem,
+  BundleOptimizationResult,
+} from "~/lib/gift-optimizer";
+import { MAX_ITEMS, optimizeGiftTiers } from "~/lib/gift-optimizer";
+import { cn } from "~/lib/utils";
 
 type PurchaseItem = {
   price: string;
   quantity: string;
-};
-
-type TieredCalculationResult = {
-  /** TIER_CONFIGS と同じ並び（門檻高 → 低） */
-  tiers: BundleOptimizationResult[];
-  combined: {
-    totalAmount: number;
-    coveredAmount: number;
-    totalGifts: number;
-  };
 };
 
 type TierConfig = {
@@ -54,19 +48,83 @@ const TIER_CONFIGS: TierConfig[] = [
   },
 ];
 
+type GiftPlan = {
+  id: string;
+  label: string;
+  /** この方案で贈る贈品（TIER_CONFIGS の code） */
+  tierCodes: string[];
+};
+
+// 切り替え可能な贈品方案（先頭がデフォルト）
+const GIFT_PLANS: GiftPlan[] = [
+  { id: "all", label: "贈品A＋B", tierCodes: ["A", "B"] },
+  { id: "b-only", label: "全部換成贈品B", tierCodes: ["B"] },
+];
+
+type TierResult = {
+  tier: TierConfig;
+  result: BundleOptimizationResult;
+};
+
+type PlanResult = {
+  plan: GiftPlan;
+  /** 門檻高 → 低 */
+  tiers: TierResult[];
+  leftover: BundleItem[];
+  combined: {
+    totalAmount: number;
+    coveredAmount: number;
+    totalGifts: number;
+  };
+};
+
 const DEFAULT_ITEMS: PurchaseItem[] = [{ price: "", quantity: "" }];
+
+/** thresholds は TIER_CONFIGS と同じ並び */
+function calculatePlan(
+  plan: GiftPlan,
+  items: BundleItem[],
+  thresholds: number[]
+): PlanResult {
+  const planTiers = TIER_CONFIGS.map((tier, index) => ({
+    tier,
+    threshold: thresholds[index],
+  })).filter(({ tier }) => plan.tierCodes.includes(tier.code));
+
+  // 門檻の高い贈品を優先しつつ、残りで作れる次の贈品の数まで含めて最適化する
+  const optimized = optimizeGiftTiers(
+    items,
+    planTiers.map(({ threshold }) => threshold)
+  );
+  const tiers: TierResult[] = planTiers.map(({ tier }, index) => ({
+    tier,
+    result: optimized.tiers[index],
+  }));
+
+  return {
+    plan,
+    tiers,
+    leftover: optimized.leftover,
+    combined: {
+      totalAmount: tiers[0]?.result.totalAmount ?? 0,
+      coveredAmount: tiers.reduce(
+        (sum, { result }) => sum + result.coveredAmount,
+        0
+      ),
+      totalGifts: tiers.reduce((sum, { result }) => sum + result.totalGifts, 0),
+    },
+  };
+}
 
 export function GiftCalculator() {
   const [thresholds, setThresholds] = useState<string[]>(
     TIER_CONFIGS.map((tier) => tier.defaultThreshold)
   );
   const [items, setItems] = useState<PurchaseItem[]>(DEFAULT_ITEMS);
-  const [calculation, setCalculation] =
-    useState<TieredCalculationResult | null>(null);
+  const [calculation, setCalculation] = useState<PlanResult[] | null>(null);
+  const [activePlanId, setActivePlanId] = useState(GIFT_PLANS[0].id);
   const [error, setError] = useState<string | null>(null);
   const [isCalculating, setIsCalculating] = useState(false);
-
-  const summary = calculation;
 
   const handleThresholdChange = (index: number, value: string) => {
     const sanitized = value.replace(/[^0-9.]/g, "");
@@ -141,24 +199,11 @@ export function GiftCalculator() {
         throw new Error(`最多只能計算合計${MAX_ITEMS}件，請調整購買數量。`);
       }
 
-      let remaining = expandedItems;
-      const tiers = parsedThresholds.map((threshold) => {
-        const result = optimizeGiftBundles(remaining, threshold);
-        remaining = result.leftover;
-        return result;
-      });
-
-      setCalculation({
-        tiers,
-        combined: {
-          totalAmount: tiers[0]?.totalAmount ?? 0,
-          coveredAmount: tiers.reduce(
-            (sum, tier) => sum + tier.coveredAmount,
-            0
-          ),
-          totalGifts: tiers.reduce((sum, tier) => sum + tier.totalGifts, 0),
-        },
-      });
+      setCalculation(
+        GIFT_PLANS.map((plan) =>
+          calculatePlan(plan, expandedItems, parsedThresholds)
+        )
+      );
     } catch (err) {
       setCalculation(null);
       const message = err instanceof Error ? err.message : "計算時發生錯誤。";
@@ -172,6 +217,7 @@ export function GiftCalculator() {
     setThresholds(TIER_CONFIGS.map((tier) => tier.defaultThreshold));
     setItems(DEFAULT_ITEMS);
     setCalculation(null);
+    setActivePlanId(GIFT_PLANS[0].id);
     setError(null);
   };
 
@@ -188,7 +234,12 @@ export function GiftCalculator() {
         onReset={handleReset}
         isCalculating={isCalculating}
       />
-      <ResultsPanel summary={summary} error={error} />
+      <ResultsPanel
+        plans={calculation}
+        activePlanId={activePlanId}
+        onSelectPlan={setActivePlanId}
+        error={error}
+      />
     </div>
   );
 }
@@ -367,30 +418,41 @@ function PurchaseItemList({
 }
 
 type ResultsPanelProps = {
-  summary: TieredCalculationResult | null;
+  plans: PlanResult[] | null;
+  activePlanId: string;
+  onSelectPlan: (planId: string) => void;
   error: string | null;
 };
 
-function ResultsPanel({ summary, error }: ResultsPanelProps) {
-  const finalLeftover = summary
-    ? (summary.tiers[summary.tiers.length - 1]?.leftover ?? [])
-    : [];
+function ResultsPanel({
+  plans,
+  activePlanId,
+  onSelectPlan,
+  error,
+}: ResultsPanelProps) {
+  const summary =
+    plans?.find(({ plan }) => plan.id === activePlanId) ?? plans?.[0] ?? null;
 
   return (
     <div className="rounded-2xl border border-white/10 bg-black/40 p-6 shadow-inner shadow-black/30">
       <h2 className="text-xl font-semibold text-white">計算結果</h2>
       {error ? (
         <p className="mt-4 text-sm text-red-300">{error}</p>
-      ) : summary ? (
+      ) : plans && summary ? (
         <div className="mt-4 space-y-6">
+          <GiftPlanSwitcher
+            plans={plans}
+            activePlanId={summary.plan.id}
+            onSelectPlan={onSelectPlan}
+          />
           <SummaryTotals summary={summary} />
           <ResultStats summary={summary} />
           <GiftCombinationList summary={summary} />
-          {finalLeftover.length ? (
+          {summary.leftover.length ? (
             <div>
               <p className="text-sm font-semibold text-white/80">未使用</p>
               <p className="text-xs text-white/70">
-                {finalLeftover
+                {summary.leftover
                   .map(
                     (item) =>
                       `#${item.position}: $${item.amount.toLocaleString()}`
@@ -409,7 +471,78 @@ function ResultsPanel({ summary, error }: ResultsPanelProps) {
   );
 }
 
-function SummaryTotals({ summary }: { summary: TieredCalculationResult }) {
+function GiftPlanSwitcher({
+  plans,
+  activePlanId,
+  onSelectPlan,
+}: Pick<ResultsPanelProps, "activePlanId" | "onSelectPlan"> & {
+  plans: PlanResult[];
+}) {
+  const groupId = useId();
+  const labelId = `${groupId}-label`;
+
+  return (
+    <div className="space-y-2">
+      <div>
+        <p id={labelId} className="text-sm text-white/70">
+          贈品方案
+        </p>
+        <p className="text-xs text-white/60">
+          不需要贈品A時，可改為全部換成贈品B。
+        </p>
+      </div>
+      <div role="radiogroup" aria-labelledby={labelId} className="space-y-2">
+        {plans.map(({ plan, tiers }) => {
+          const isActive = plan.id === activePlanId;
+
+          return (
+            <label
+              key={plan.id}
+              className={cn(
+                "relative flex cursor-pointer flex-wrap items-center justify-between gap-x-3 gap-y-0.5 rounded-md border px-3 py-2.5 text-sm transition-colors has-[:focus-visible]:ring-[3px] has-[:focus-visible]:ring-white/40",
+                isActive
+                  ? "border-emerald-400/70 bg-emerald-500/20 text-white"
+                  : "border-white/10 bg-white/5 text-white/70 hover:bg-white/10 hover:text-white"
+              )}
+            >
+              <span className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name={groupId}
+                  value={plan.id}
+                  className="sr-only"
+                  checked={isActive}
+                  onChange={() => onSelectPlan(plan.id)}
+                />
+                <span
+                  aria-hidden
+                  className={cn(
+                    "flex size-4 shrink-0 items-center justify-center rounded-full border",
+                    isActive ? "border-emerald-300" : "border-white/40"
+                  )}
+                >
+                  {isActive ? (
+                    <span className="size-2 rounded-full bg-emerald-300" />
+                  ) : null}
+                </span>
+                <span className="font-semibold">{plan.label}</span>
+              </span>
+              <span className="text-xs">
+                {tiers
+                  .map(
+                    ({ tier, result }) => `${tier.code} ${result.totalGifts}份`
+                  )
+                  .join("・")}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function SummaryTotals({ summary }: { summary: PlanResult }) {
   return (
     <div className="space-y-4">
       <div>
@@ -419,35 +552,35 @@ function SummaryTotals({ summary }: { summary: TieredCalculationResult }) {
         </p>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-2">
-        {TIER_CONFIGS.map((tier, index) => {
-          const result = summary.tiers[index];
-          if (!result) return null;
-
-          return (
-            <div
-              key={tier.label}
-              className={`rounded-2xl border border-white/10 bg-gradient-to-br ${tier.cardAccent} p-4 text-center shadow-lg shadow-black/30`}
-            >
-              <p className="text-xs font-semibold uppercase tracking-wide text-white/90">
-                {tier.label}
-              </p>
-              <p className="text-4xl font-black text-white">
-                {result.totalGifts}
-                <span className="ml-1 text-base font-semibold">份</span>
-              </p>
-              <p className="text-xs text-white/90">
-                門檻 ${result.threshold.toLocaleString()}
-              </p>
-            </div>
-          );
-        })}
+      <div
+        className={cn(
+          "grid gap-3",
+          summary.tiers.length > 1 && "md:grid-cols-2"
+        )}
+      >
+        {summary.tiers.map(({ tier, result }) => (
+          <div
+            key={tier.label}
+            className={`rounded-2xl border border-white/10 bg-gradient-to-br ${tier.cardAccent} p-4 text-center shadow-lg shadow-black/30`}
+          >
+            <p className="text-xs font-semibold uppercase tracking-wide text-white/90">
+              {tier.label}
+            </p>
+            <p className="text-4xl font-black text-white">
+              {result.totalGifts}
+              <span className="ml-1 text-base font-semibold">份</span>
+            </p>
+            <p className="text-xs text-white/90">
+              門檻 ${result.threshold.toLocaleString()}
+            </p>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function ResultStats({ summary }: { summary: TieredCalculationResult }) {
+function ResultStats({ summary }: { summary: PlanResult }) {
   return (
     <div className="grid gap-3 text-sm text-white/80">
       <p>
@@ -464,74 +597,63 @@ function ResultStats({ summary }: { summary: TieredCalculationResult }) {
       </p>
       <p>
         門檻金額:{" "}
-        {TIER_CONFIGS.map((tier, index) => {
-          const result = summary.tiers[index];
-          if (!result) return null;
-
-          return (
-            <span
-              key={tier.label}
-              className={`mr-1 font-semibold ${tier.textAccent}`}
-            >
-              {tier.code} ${result.threshold.toLocaleString()}
-            </span>
-          );
-        })}
+        {summary.tiers.map(({ tier, result }) => (
+          <span
+            key={tier.label}
+            className={`mr-1 font-semibold ${tier.textAccent}`}
+          >
+            {tier.code} ${result.threshold.toLocaleString()}
+          </span>
+        ))}
       </p>
     </div>
   );
 }
 
-function GiftCombinationList({ summary }: { summary: TieredCalculationResult }) {
+function GiftCombinationList({ summary }: { summary: PlanResult }) {
   return (
     <div className="space-y-4">
-      {TIER_CONFIGS.map((tier, index) => {
-        const result = summary.tiers[index];
-        if (!result) return null;
-
-        return (
-          <div key={tier.label}>
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm font-semibold text-white/80">
-                {tier.label} 的組合
-              </p>
-              <p className={`text-xs font-semibold ${tier.textAccent}`}>
-                門檻 ${result.threshold.toLocaleString()} ／ {result.totalGifts}
-                份
-              </p>
-            </div>
-            {result.groups.length ? (
-              <ul className="space-y-2 text-sm text-white/90">
-                {result.groups.map((group, groupIndex) => (
-                  <li
-                    key={`${tier.label}-${groupIndex}`}
-                    className="rounded-xl border border-white/10 bg-white/5 p-4"
-                  >
-                    <p className="text-xs uppercase text-white/60">
-                      組合 {groupIndex + 1}
-                    </p>
-                    <p className="text-lg font-semibold text-white">
-                      合計 ${group.total.toLocaleString()}
-                    </p>
-                    <p className="text-xs text-white/70">
-                      {group.items
-                        .map(
-                          (item) =>
-                            `#${item.position}: $${item.amount.toLocaleString()}`
-                        )
-                        .join(" + ")}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-sm text-white/70">
-                沒有符合 {tier.label} 門檻的組合。
-              </p>
-            )}
+      {summary.tiers.map(({ tier, result }) => (
+        <div key={tier.label}>
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-semibold text-white/80">
+              {tier.label} 的組合
+            </p>
+            <p className={`text-xs font-semibold ${tier.textAccent}`}>
+              門檻 ${result.threshold.toLocaleString()} ／ {result.totalGifts}份
+            </p>
           </div>
-        );
-      })}
+          {result.groups.length ? (
+            <ul className="space-y-2 text-sm text-white/90">
+              {result.groups.map((group, groupIndex) => (
+                <li
+                  key={`${tier.label}-${groupIndex}`}
+                  className="rounded-xl border border-white/10 bg-white/5 p-4"
+                >
+                  <p className="text-xs uppercase text-white/60">
+                    組合 {groupIndex + 1}
+                  </p>
+                  <p className="text-lg font-semibold text-white">
+                    合計 ${group.total.toLocaleString()}
+                  </p>
+                  <p className="text-xs text-white/70">
+                    {group.items
+                      .map(
+                        (item) =>
+                          `#${item.position}: $${item.amount.toLocaleString()}`
+                      )
+                      .join(" + ")}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-white/70">
+              沒有符合 {tier.label} 門檻的組合。
+            </p>
+          )}
+        </div>
+      ))}
     </div>
   );
 }
