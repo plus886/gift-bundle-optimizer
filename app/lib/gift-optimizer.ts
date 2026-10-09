@@ -1,10 +1,31 @@
 // gift-bundle-optimizer.ts
-// Greedy (best-fit) + light local improvements.
+// 合計が門檻（threshold）以上になるアイテムの組を、できるだけ多く作る。
 // - 3点以上OK
 // - 同一商品（同額）を複数個扱うのは「別BundleItemとして渡す」ことで対応
 //   例: 500円を4つ -> [{amount:500,pos:1},{amount:500,pos:2},{amount:500,pos:3},{amount:500,pos:4}]
+//
+// 解き方:
+// 1) 同額アイテムを「金額の種類ごとの個数」にまとめ、個数ベクトル上の動的計画法で厳密解を求める。
+//    門檻が複数あるときは前の段を優先し、前の段の組数を最大に保ったまま
+//    次の段の組数が最大になる組み方を選ぶ。
+// 2) 種類や個数が多く表が大きくなりすぎるときは、均等に分割して部分ごとに厳密に解き、
+//    余りを集めて解き直す（近似）。従来の貪欲法の結果とも比べ、良い方を採用する。
+//
+// 変更したら `node scripts/verify-gift-optimizer.ts` で総当たりの最適解と照合できる。
 
 export const MAX_ITEMS = 1000;
+
+/** 厳密解法に使う計算量（表のセル数 × 金額の種類数）の既定上限 */
+const DEFAULT_MAX_EXACT_WORK = 4_000_000;
+/** 1つの表のセル数の上限（メモリ対策） */
+const MAX_TABLE_CELLS = 1 << 21;
+/** 表に載せられる門檻の上限（Int32Array に収めるため） */
+const MAX_TABLE_THRESHOLD = 1 << 30;
+/** 分割して解き直す深さの上限 */
+const MAX_CHUNK_DEPTH = 4;
+/** 近似解の改善: 並べ替えて解き直す回数と、予算を何回分の解き直しに割るか */
+const REFINE_PASSES = 4;
+const REFINE_STEPS = 12;
 
 export type BundleItem = {
   amount: number;
@@ -25,12 +46,23 @@ export type BundleOptimizationResult = {
   coveredAmount: number;
 };
 
+export type TieredOptimizationResult = {
+  /** thresholds と同じ並び。各段の leftover は「その段までで使われなかったアイテム」 */
+  tiers: BundleOptimizationResult[];
+  /** どの段にも使われなかったアイテム */
+  leftover: BundleItem[];
+  /** 全段を厳密に解けたか（false は分割や貪欲法による近似を含む） */
+  exact: boolean;
+};
+
 export type OptimizeOptions = {
-  /** 局所改善の最大反復回数（未指定なら items.length * 4 を上限にしつつ cap もかける） */
+  /** 厳密解法に使う計算量（表のセル数 × 金額の種類数）の上限。超える分は近似で解く */
+  maxExactWork?: number;
+  /** 貪欲法: 局所改善の最大反復回数（未指定なら items.length * 4 を上限にしつつ cap もかける） */
   maxImproveIters?: number;
-  /** poolのソートを何回に1回やり直すか（寄付で乱れたときの再ソート頻度） */
+  /** 貪欲法: poolのソートを何回に1回やり直すか（寄付で乱れたときの再ソート頻度） */
   resortEvery?: number;
-  /** trueなら完成グループの余剰から「直接」未達を完成させる改善も試す */
+  /** 貪欲法: trueなら完成グループの余剰から「直接」未達を完成させる改善も試す */
   enableDirectDonate?: boolean;
 };
 
@@ -46,60 +78,677 @@ function sanitizeItems(items: BundleItem[]): BundleItem[] {
 }
 
 /**
+ * 複数の門檻（段）をまとめて最適化する。thresholds は優先度の高い順。
+ * 前の段の組数を最大にしたうえで、残りから作れる次の段の組数が最大になる組み方を選ぶ
+ * （例: [2000, 1000] なら、2000の組数が最大の組み方のうち、1000の組数が最も多いもの）。
  * 3点以上の組み合わせOK / 同一商品複数OK（BundleItemを個数分渡す）
- * ブラウザで動かす前提のため「厳密解」ではなく、強めの貪欲＋局所改善。
  */
+export function optimizeGiftTiers(
+  items: BundleItem[],
+  thresholds: number[],
+  options: OptimizeOptions = {}
+): TieredOptimizationResult {
+  const sanitized = sanitizeItems(items);
+  const { tiers: assignments, exact } = assignTiers(
+    sanitized,
+    thresholds,
+    options
+  );
+
+  const amountOf = (indexes: number[]) =>
+    indexes.reduce((sum, index) => sum + sanitized[index].amount, 0);
+  const used = sanitized.map(() => false);
+  let remaining = sanitized.map((_, index) => index);
+
+  const tiers = thresholds.map(
+    (threshold, tierIndex): BundleOptimizationResult => {
+      const totalAmount = amountOf(remaining);
+
+      // 出力整形（position順で見やすく）
+      const groups = sortGroupsByPosition(
+        assignments[tierIndex].map((indexes) => ({
+          total: amountOf(indexes),
+          items: indexes.map((index) => sanitized[index]),
+        }))
+      );
+
+      for (const indexes of assignments[tierIndex]) {
+        for (const index of indexes) used[index] = true;
+      }
+      remaining = remaining.filter((index) => !used[index]);
+
+      return {
+        groups,
+        leftover: remaining.map((index) => sanitized[index]),
+        totalGifts: groups.length,
+        threshold,
+        totalAmount,
+        coveredAmount: groups.reduce((sum, group) => sum + group.total, 0),
+      };
+    }
+  );
+
+  return {
+    tiers,
+    leftover: remaining.map((index) => sanitized[index]),
+    exact,
+  };
+}
+
+/** 門檻が1つだけの場合 */
 export function optimizeGiftBundles(
   items: BundleItem[],
   threshold: number,
   options: OptimizeOptions = {}
 ): BundleOptimizationResult {
-  const sanitized = sanitizeItems(items);
+  return optimizeGiftTiers(items, [threshold], options).tiers[0];
+}
 
-  const totalAmount = sanitized.reduce((s, it) => s + it.amount, 0);
+/** 1組 = アイテム（sanitize 後の配列の index）の並び */
+type TierAssignment = number[][];
 
-  if (!sanitized.length || threshold <= 0) {
-    return {
-      groups: [],
-      leftover: sanitized,
-      totalGifts: 0,
-      threshold,
-      totalAmount,
-      coveredAmount: 0,
-    };
+function assignTiers(
+  items: BundleItem[],
+  thresholds: number[],
+  options: OptimizeOptions
+): { tiers: TierAssignment[]; exact: boolean } {
+  // 同額アイテムを1つの「種類」にまとめる（金額の昇順）
+  const order = items
+    .map((_, index) => index)
+    .sort((a, b) => items[a].amount - items[b].amount || a - b);
+  const amounts: number[] = [];
+  const members: number[][] = [];
+  for (const index of order) {
+    if (amounts[amounts.length - 1] !== items[index].amount) {
+      amounts.push(items[index].amount);
+      members.push([]);
+    }
+    members[members.length - 1].push(index);
   }
+  const counts = members.map((indexes) => indexes.length);
 
-  // 1) 初期解：Largest-first + Best-Fit（未達箱のみを対象にする）
-  const { completed, pool } = buildInitialSolution(sanitized, threshold);
-
-  // 2) 局所改善：poolから追加グループ生成 / 完成グループから寄付して再挑戦 / 直接寄付で1手完成
-  performLocalImprovements(
-    completed,
-    pool,
-    threshold,
-    sanitized.length,
-    options
+  // 合計は整数なので、門檻は切り上げて整数で比較する。無効な門檻の段は何も作らない
+  const limits = thresholds.map((threshold) =>
+    Number.isFinite(threshold) && threshold > 0
+      ? Math.ceil(threshold)
+      : undefined
   );
+  const meter: WorkMeter = {
+    left: options.maxExactWork ?? DEFAULT_MAX_EXACT_WORK,
+  };
 
-  // 3) 出力整形（position順で見やすく）
-  const normalizedGroups = sortGroupsByPosition(completed);
+  let exact = true;
+  let prebuilt: CountTable | undefined;
+  const typeGroups: number[][][] = [];
+  for (let tierIndex = 0; tierIndex < limits.length; tierIndex++) {
+    const limit = limits[tierIndex];
+    if (limit === undefined) {
+      typeGroups.push([]);
+      continue;
+    }
 
-  const usedPositions = new Set<number>();
-  for (const g of normalizedGroups) {
-    for (const it of g.items) usedPositions.add(it.position);
+    const nextLimit = limits
+      .slice(tierIndex + 1)
+      .find((value) => value !== undefined);
+    const solved = solveTier(amounts, counts, limit, nextLimit, meter, prebuilt);
+    if (!solved.exact) exact = false;
+    prebuilt = solved.next;
+    typeGroups.push(solved.groups);
   }
 
-  const leftover = sanitized.filter((it) => !usedPositions.has(it.position));
-  const coveredAmount = normalizedGroups.reduce((s, g) => s + g.total, 0);
+  // 種類 → 実際のアイテム（同額なら入力順の早いものから使う）
+  const cursor = members.map(() => 0);
+  const tiers = typeGroups.map((groups) =>
+    groups.map((group) => group.map((type) => members[type][cursor[type]++]))
+  );
+  if (exact) return { tiers, exact };
 
-  return {
-    groups: normalizedGroups,
-    leftover,
-    totalGifts: normalizedGroups.length,
+  // 近似が混ざった場合は、従来の貪欲法より悪くならないことを保証する
+  const greedy = assignTiersGreedy(items, thresholds, options);
+  for (let tierIndex = 0; tierIndex < tiers.length; tierIndex++) {
+    const diff = greedy[tierIndex].length - tiers[tierIndex].length;
+    if (diff !== 0) return { tiers: diff > 0 ? greedy : tiers, exact };
+  }
+  return { tiers, exact };
+}
+
+// ---------------------------------------------------------------------------
+// 厳密解法（金額の種類ごとの個数ベクトル上の動的計画法）
+//
+// 種類は金額の昇順に並べ、amounts[type] が金額、counts[type] が残りの個数。
+// 1組は種類 index の配列で表す。
+// ---------------------------------------------------------------------------
+
+type WorkMeter = { left: number };
+
+type CountTable = {
+  threshold: number;
+  /** 表が扱う種類（金額の昇順） */
+  types: number[];
+  /** 個数ベクトルを状態番号にするときの、種類ごとの重み（混合基数） */
+  strides: number[];
+  /** その個数ベクトルのアイテムだけで作れる組数の最大 */
+  cnt: Int32Array;
+  /** 上の組数を保ったまま、作りかけの組に残せる合計の最大 */
+  part: Int32Array;
+};
+
+type TierSolution = {
+  groups: number[][];
+  /** 次の段の先読みに使った表（次の段でそのまま使い回す） */
+  next?: CountTable;
+  /** 次の段の先読みまで含めて厳密に解けたか */
+  exact: boolean;
+};
+
+/** counts から threshold 以上の組を取り出す（counts は残りの個数に更新される） */
+function solveTier(
+  amounts: number[],
+  counts: number[],
+  threshold: number,
+  nextThreshold: number | undefined,
+  meter: WorkMeter,
+  prebuilt: CountTable | undefined
+): TierSolution {
+  // 単品で門檻を満たすアイテムは、1点で1組にするのが最適
+  const singles: number[][] = [];
+  for (let type = 0; type < amounts.length; type++) {
+    if (amounts[type] < threshold) continue;
+    for (; counts[type] > 0; counts[type]--) singles.push([type]);
+  }
+
+  const solved = solveSmallExact(
+    amounts,
+    counts,
     threshold,
-    totalAmount,
-    coveredAmount,
+    nextThreshold,
+    meter,
+    prebuilt
+  );
+  if (solved) return { ...solved, groups: singles.concat(solved.groups) };
+
+  const approximated = refineGroups(
+    amounts,
+    counts,
+    solveSmallChunked(amounts, counts, threshold, nextThreshold, meter, 0),
+    threshold,
+    nextThreshold,
+    meter
+  );
+  return { groups: singles.concat(approximated), exact: false };
+}
+
+/** counts > 0 かつ金額が threshold 未満の種類 */
+function smallTypes(
+  amounts: number[],
+  counts: number[],
+  threshold: number
+): number[] {
+  const types: number[] = [];
+  for (let type = 0; type < amounts.length; type++) {
+    if (counts[type] > 0 && amounts[type] < threshold) types.push(type);
+  }
+  return types;
+}
+
+/** types のうち個数が残っている種類で表を作るときの計算量（大きすぎる場合は Infinity） */
+function tableWork(counts: number[], types: number[]): number {
+  let cells = 1;
+  let kinds = 0;
+  for (const type of types) {
+    if (counts[type] === 0) continue;
+    kinds++;
+    cells *= counts[type] + 1;
+    if (cells > MAX_TABLE_CELLS) return Infinity;
+  }
+  return cells * kinds;
+}
+
+/**
+ * types の全ての個数ベクトルについて「作れる組数の最大」を求める。
+ *
+ * アイテムを1点ずつ作りかけの組に足していき、合計が threshold に達したら1組完成とする。
+ * 各個数ベクトルで (完成した組数, 作りかけの合計) が辞書順で最大のものだけ覚えておけば、
+ * 完成した組数がそのまま最適値になる。
+ */
+function buildCountTable(
+  amounts: number[],
+  counts: number[],
+  types: number[],
+  threshold: number
+): CountTable {
+  const k = types.length;
+  const amt = types.map((type) => amounts[type]);
+  const bounds = types.map((type) => counts[type]);
+  const strides: number[] = [];
+  let cells = 1;
+  for (const bound of bounds) {
+    strides.push(cells);
+    cells *= bound + 1;
+  }
+
+  const cnt = new Int32Array(cells);
+  const part = new Int32Array(cells);
+  const digits = new Int32Array(k);
+
+  for (let state = 1; state < cells; state++) {
+    // digits を state の個数ベクトルに進める
+    let carry = 0;
+    while (digits[carry] === bounds[carry]) digits[carry++] = 0;
+    digits[carry]++;
+
+    let bestCnt = -1;
+    let bestPart = -1;
+    for (let j = 0; j < k; j++) {
+      if (digits[j] === 0) continue;
+      // 種類 j の1点を最後に足した場合
+      const prev = state - strides[j];
+      let c = cnt[prev];
+      let p = part[prev] + amt[j];
+      if (p >= threshold) {
+        c++;
+        p = 0;
+      }
+      if (c > bestCnt || (c === bestCnt && p > bestPart)) {
+        bestCnt = c;
+        bestPart = p;
+      }
+    }
+    cnt[state] = bestCnt;
+    part[state] = bestPart;
+  }
+
+  return { threshold, types, strides, cnt, part };
+}
+
+/**
+ * 単品では threshold に届かないアイテムだけで、組数が最大になる組み方を求める。
+ * 表が大きすぎて作れない場合は null（counts は変更しない）。
+ */
+function solveSmallExact(
+  amounts: number[],
+  counts: number[],
+  threshold: number,
+  nextThreshold: number | undefined,
+  meter: WorkMeter,
+  prebuilt?: CountTable
+): TierSolution | null {
+  let table = prebuilt?.threshold === threshold ? prebuilt : undefined;
+  const types = table ? table.types : smallTypes(amounts, counts, threshold);
+  const k = types.length;
+  const amt = types.map((type) => amounts[type]);
+  const rem = types.map((type) => counts[type]);
+
+  let total = 0;
+  for (let i = 0; i < k; i++) total += rem[i] * amt[i];
+  if (total < threshold) return { groups: [], exact: true };
+
+  if (!table) {
+    const work = tableWork(counts, types);
+    if (threshold > MAX_TABLE_THRESHOLD || work > meter.left) return null;
+    meter.left -= work;
+    table = buildCountTable(amounts, counts, types, threshold);
+  }
+  const { strides, cnt, part } = table;
+
+  // 残り (rem - u) から次の段で作れる組数
+  //   = 単品で次の門檻を満たす残数 + それ未満の種類だけで作れる組数（表引き）
+  const singleNext = rem.map(() => 0);
+  const nextStrides = rem.map(() => 0);
+  let nextTable: CountTable | undefined;
+  let exact = true;
+  if (nextThreshold !== undefined) {
+    const nextTypes: number[] = [];
+    let nextTotal = 0;
+    for (let i = 0; i < k; i++) {
+      if (amt[i] >= nextThreshold) {
+        singleNext[i] = 1;
+      } else if (rem[i] > 0) {
+        nextTypes.push(types[i]);
+        nextTotal += rem[i] * amt[i];
+      }
+    }
+    if (nextTotal >= nextThreshold) {
+      const work = tableWork(counts, nextTypes);
+      if (nextThreshold <= MAX_TABLE_THRESHOLD && work <= meter.left) {
+        meter.left -= work;
+        nextTable = buildCountTable(amounts, counts, nextTypes, nextThreshold);
+        let n = 0;
+        for (let i = 0; i < k; i++) {
+          if (singleNext[i] === 0 && rem[i] > 0) {
+            nextStrides[i] = nextTable.strides[n++];
+          }
+        }
+      } else {
+        exact = false;
+      }
+    }
+  }
+  const nextCnt = nextTable?.cnt;
+
+  // rem 以下の個数ベクトル u を全て調べ、組数が最大のまま
+  //   1) 次の段で作れる組数が最大
+  //   2) 使う金額の合計が最小（＝余計なアイテムを巻き込まない）
+  // になるものを選ぶ
+  let fullState = 0;
+  let nextState = 0;
+  let singlesLeft = 0;
+  for (let i = 0; i < k; i++) {
+    fullState += rem[i] * strides[i];
+    nextState += rem[i] * nextStrides[i];
+    singlesLeft += rem[i] * singleNext[i];
+  }
+  const target = cnt[fullState];
+
+  const digits = rem.map(() => 0);
+  let state = 0;
+  let usedAmount = 0;
+  let bestState = 0;
+  let bestNext = -1;
+  let bestAmount = 0;
+  for (;;) {
+    if (cnt[state] === target) {
+      const next = singlesLeft + (nextCnt ? nextCnt[nextState] : 0);
+      if (next > bestNext || (next === bestNext && usedAmount < bestAmount)) {
+        bestState = state;
+        bestNext = next;
+        bestAmount = usedAmount;
+      }
+    }
+
+    // u を次の個数ベクトルに進める
+    let i = 0;
+    for (; i < k && digits[i] === rem[i]; i++) {
+      const n = digits[i];
+      state -= n * strides[i];
+      usedAmount -= n * amt[i];
+      nextState += n * nextStrides[i];
+      singlesLeft += n * singleNext[i];
+      digits[i] = 0;
+    }
+    if (i === k) break;
+    digits[i]++;
+    state += strides[i];
+    usedAmount += amt[i];
+    nextState -= nextStrides[i];
+    singlesLeft -= singleNext[i];
+  }
+
+  // 選んだ個数ベクトルを1点ずつ遡って、アイテムを足した順番（の逆順）を復元する
+  let placed = 0;
+  state = bestState;
+  for (let i = k - 1; i >= 0; i--) {
+    digits[i] = Math.floor(state / strides[i]);
+    state -= digits[i] * strides[i];
+    placed += digits[i];
+  }
+  const sequence: number[] = [];
+  state = bestState;
+  for (; placed > 0; placed--) {
+    for (let j = 0; j < k; j++) {
+      if (digits[j] === 0) continue;
+      const prev = state - strides[j];
+      let c = cnt[prev];
+      let p = part[prev] + amt[j];
+      if (p >= threshold) {
+        c++;
+        p = 0;
+      }
+      if (c === cnt[state] && p === part[state]) {
+        sequence.push(j);
+        digits[j]--;
+        state = prev;
+        break;
+      }
+    }
+  }
+
+  // 足した順に並べ直し、門檻に達するたびに1組として切り出す
+  const groups: number[][] = [];
+  let current: number[] = [];
+  let sum = 0;
+  for (let n = sequence.length - 1; n >= 0; n--) {
+    current.push(types[sequence[n]]);
+    sum += amt[sequence[n]];
+    if (sum >= threshold) {
+      for (const type of current) counts[type]--;
+      groups.push(current);
+      current = [];
+      sum = 0;
+    }
+  }
+
+  return { groups, next: nextTable, exact };
+}
+
+// ---------------------------------------------------------------------------
+// 表が大きすぎるときの近似（分割して厳密に解く）
+// ---------------------------------------------------------------------------
+
+type Chunk = { counts: number[]; copies: number };
+
+/**
+ * アイテムを均等に分割してそれぞれを厳密に解き、余りを集めてもう一度解く。
+ * counts は残りの個数に更新される。
+ */
+function solveSmallChunked(
+  amounts: number[],
+  counts: number[],
+  threshold: number,
+  nextThreshold: number | undefined,
+  meter: WorkMeter,
+  depth: number
+): number[][] {
+  if (threshold > MAX_TABLE_THRESHOLD) return [];
+
+  const types = smallTypes(amounts, counts, threshold);
+  let itemCount = 0;
+  for (const type of types) itemCount += counts[type];
+
+  // 表の合計が予算に収まる最小の分割数を探す（先読みの表の分も見込む）
+  const budget = meter.left / 2;
+  let chunks: Chunk[] | undefined;
+  for (
+    let chunkCount = 2;
+    chunkCount <= itemCount;
+    chunkCount = chunkCount < 8 ? chunkCount + 1 : Math.ceil(chunkCount * 1.25)
+  ) {
+    const candidate = splitIntoChunks(counts, types, chunkCount);
+    let work = 0;
+    for (const chunk of candidate) work += 2 * tableWork(chunk.counts, types);
+    if (work <= budget) {
+      chunks = candidate;
+      break;
+    }
+  }
+  if (!chunks) return [];
+
+  const groups: number[][] = [];
+  const pool = counts.map(() => 0);
+  for (const chunk of chunks) {
+    const solved = solveSmallExact(
+      amounts,
+      chunk.counts,
+      threshold,
+      nextThreshold,
+      meter
+    );
+    for (let copy = 0; copy < chunk.copies; copy++) {
+      if (solved) groups.push(...solved.groups);
+      for (const type of types) pool[type] += chunk.counts[type];
+    }
+  }
+  if (groups.length === 0) return [];
+
+  // 各分割の余りを集めて、まだ組が作れないか解き直す
+  for (const type of types) counts[type] = pool[type];
+  const rest =
+    solveSmallExact(amounts, counts, threshold, nextThreshold, meter)?.groups ??
+    (depth + 1 < MAX_CHUNK_DEPTH
+      ? solveSmallChunked(
+          amounts,
+          counts,
+          threshold,
+          nextThreshold,
+          meter,
+          depth + 1
+        )
+      : []);
+  return groups.concat(rest);
+}
+
+/** counts を chunkCount 個にできるだけ均等に分ける（同じ内容の分割は1つにまとめる） */
+function splitIntoChunks(
+  counts: number[],
+  types: number[],
+  chunkCount: number
+): Chunk[] {
+  const parts = Array.from({ length: chunkCount }, () => counts.map(() => 0));
+  let offset = 0;
+  for (const type of types) {
+    const base = Math.floor(counts[type] / chunkCount);
+    const extra = counts[type] % chunkCount;
+    for (let n = 0; n < chunkCount; n++) parts[n][type] = base;
+    // 端数は配り先をずらしながら1点ずつ配り、特定の分割に偏らせない
+    for (let n = 0; n < extra; n++) parts[(offset + n) % chunkCount][type]++;
+    offset = (offset + extra) % chunkCount;
+  }
+
+  const unique = new Map<string, Chunk>();
+  for (const part of parts) {
+    const key = part.join(",");
+    const same = unique.get(key);
+    if (same) same.copies++;
+    else unique.set(key, { counts: part, copies: 1 });
+  }
+  return [...unique.values()];
+}
+
+/**
+ * 近似で作った組を改善する。組の一部と余り（counts）全部を1つの小さな問題として
+ * 厳密に解き直すことを、組み合わせを変えながら繰り返す。
+ * 解き直した結果は元の組数以上になるので、悪くなることはない。
+ */
+function refineGroups(
+  amounts: number[],
+  counts: number[],
+  groups: number[][],
+  threshold: number,
+  nextThreshold: number | undefined,
+  meter: WorkMeter
+): number[][] {
+  const types: number[] = [];
+  for (let type = 0; type < amounts.length; type++) {
+    if (amounts[type] < threshold) types.push(type);
+  }
+
+  // 次の段の分を残すため、使うのは残り予算の半分まで
+  let budget = meter.left / 2;
+  const stepWork = budget / REFINE_STEPS;
+  const random = createRandom(groups.length);
+
+  let current = groups;
+  for (let pass = 0; pass < REFINE_PASSES; pass++) {
+    // 毎回違う組み合わせを解き直せるように並べ替える
+    current = current.slice();
+    for (let i = current.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [current[i], current[j]] = [current[j], current[i]];
+    }
+
+    const refined: number[][] = [];
+    for (let start = 0; start < current.length; ) {
+      if (budget < stepWork) {
+        refined.push(...current.slice(start));
+        break;
+      }
+
+      // 表が stepWork に収まる範囲で、解き直す組を集める
+      const pooled = counts.slice();
+      let end = start;
+      for (; end < current.length; end++) {
+        for (const type of current[end]) pooled[type]++;
+        if (2 * tableWork(pooled, types) > stepWork) {
+          for (const type of current[end]) pooled[type]--;
+          break;
+        }
+      }
+      if (end === start) {
+        refined.push(current[start++]);
+        continue;
+      }
+
+      const before = meter.left;
+      const solved = solveSmallExact(
+        amounts,
+        pooled,
+        threshold,
+        nextThreshold,
+        meter
+      );
+      budget -= before - meter.left;
+
+      if (solved) {
+        refined.push(...solved.groups);
+        for (const type of types) counts[type] = pooled[type];
+      } else {
+        refined.push(...current.slice(start, end));
+      }
+      start = end;
+    }
+    current = refined;
+  }
+  return current;
+}
+
+/** 入力が同じなら結果も同じになるよう、固定の種から作る擬似乱数 */
+function createRandom(seed: number): () => number {
+  let state = (seed + 1) >>> 0;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
   };
+}
+
+// ---------------------------------------------------------------------------
+// 従来の貪欲法（Largest-first + Best-Fit ＋ 局所改善）
+// 厳密に解けない規模のときの比較用。
+// ---------------------------------------------------------------------------
+
+/** 全ての段を貪欲法で順に解く */
+function assignTiersGreedy(
+  items: BundleItem[],
+  thresholds: number[],
+  options: OptimizeOptions
+): TierAssignment[] {
+  // position が重複していても区別できるよう、index を position として渡す
+  let pool: BundleItem[] = items.map((item, index) => ({
+    amount: item.amount,
+    position: index,
+  }));
+
+  return thresholds.map((threshold) => {
+    if (!(threshold > 0)) return [];
+
+    // 1) 初期解：Largest-first + Best-Fit（未達箱のみを対象にする）
+    const { completed, pool: unplaced } = buildInitialSolution(pool, threshold);
+
+    // 2) 局所改善：poolから追加グループ生成 / 完成グループから寄付して再挑戦 / 直接寄付で1手完成
+    performLocalImprovements(
+      completed,
+      unplaced,
+      threshold,
+      pool.length,
+      options
+    );
+
+    const used = new Set<number>();
+    for (const group of completed) {
+      for (const item of group.items) used.add(item.position);
+    }
+    pool = pool.filter((item) => !used.has(item.position));
+    return completed.map((group) => group.items.map((item) => item.position));
+  });
 }
 
 /** 初期解：大きい順に、未達グループへ best-fit で詰め、達したら完成へ移動 */
